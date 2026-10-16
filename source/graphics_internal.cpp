@@ -1,3 +1,4 @@
+// Modified 2026-10-16: validate swapchain size, pause minimized rendering, and check frame results.
 #include "graphics_internal.hpp"
 
 #include <iostream>
@@ -24,6 +25,33 @@
 namespace graphics::internal {
 
 namespace {
+
+GLFWwindow* vk_window = nullptr;
+
+bool waitForWindowExtent(uint32_t& width, uint32_t& height) {
+    int framebuffer_width = 0;
+    int framebuffer_height = 0;
+    glfwGetFramebufferSize(vk_window, &framebuffer_width, &framebuffer_height);
+
+    while ((framebuffer_width == 0 || framebuffer_height == 0) &&
+           !glfwWindowShouldClose(vk_window)) {
+        glfwWaitEvents();
+        glfwGetFramebufferSize(vk_window, &framebuffer_width, &framebuffer_height);
+    }
+
+    if (glfwWindowShouldClose(vk_window)) {
+        return false;
+    }
+
+    width = static_cast<uint32_t>(framebuffer_width);
+    height = static_cast<uint32_t>(framebuffer_height);
+    return true;
+}
+
+void stopRendering(const char* message) {
+    std::cerr << message << '\n';
+    glfwSetWindowShouldClose(vk_window, GLFW_TRUE);
+}
 
 VkInstance vk_instance;
 uint32_t vk_api_version;
@@ -244,7 +272,15 @@ void drawImGUI() {
 }
 
 bool rebuildSwapchain(uint32_t width, uint32_t height) {
-	vkQueueWaitIdle(context.graphics_queue);
+    // Use the current pixel dimensions, including when no resize callback ran.
+    if (!waitForWindowExtent(width, height)) {
+        return false;
+    }
+
+    if (vkQueueWaitIdle(context.graphics_queue) != VK_SUCCESS) {
+        stopRendering("Failed to wait for the graphics queue before resizing");
+        return false;
+    }
 
 	vkb::SwapchainBuilder sb(context.physical_device, context.device, vk_surface,
 	                         context.graphics_queue_index, context.graphics_queue_index);
@@ -256,16 +292,30 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 					   .set_old_swapchain(vk_swapchain)
 					   .build();
 	if (!sb_result) {
-		std::cerr << sb_result.error().message() << '\n';
+        std::cerr << sb_result.error().message() << '\n';
+        stopRendering("Failed to recreate Vulkan swapchain");
+        return false;
 	}
 
 	auto vkb_swapchain = sb_result.value();
+    if (vkb_swapchain.extent.width == 0 || vkb_swapchain.extent.height == 0) {
+        vkDestroySwapchainKHR(context.device, vkb_swapchain.swapchain, nullptr);
+        stopRendering("The recreated swapchain has a zero extent");
+        return false;
+    }
 
-	for (size_t i = 0, n = vk_swapchain_image_views.size(); i < n; ++i) {
-		vkDestroyFramebuffer(context.device, vk_imgui_framebuffers[i], nullptr);
-		vkDestroyFramebuffer(context.device, vk_framebuffers[i], nullptr);
-		vkDestroyImageView(context.device, vk_swapchain_image_views[i], nullptr);
-	}
+    for (VkFramebuffer framebuffer : vk_imgui_framebuffers) {
+        vkDestroyFramebuffer(context.device, framebuffer, nullptr);
+    }
+    vk_imgui_framebuffers.clear();
+    for (VkFramebuffer framebuffer : vk_framebuffers) {
+        vkDestroyFramebuffer(context.device, framebuffer, nullptr);
+    }
+    vk_framebuffers.clear();
+    for (VkImageView image_view : vk_swapchain_image_views) {
+        vkDestroyImageView(context.device, image_view, nullptr);
+    }
+    vk_swapchain_image_views.clear();
 
 	vkDestroySwapchainKHR(context.device, vk_swapchain, nullptr);
 
@@ -280,7 +330,10 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 	vk_swapchain_image_views = std::move(swapchain_image_views);
 
 	vkDestroyImageView(context.device, vk_image_view_depth_buffer, nullptr);
+    vk_image_view_depth_buffer = VK_NULL_HANDLE;
 	vmaDestroyImage(context.allocator, vk_image_depth_buffer, vma_allocation_depth_buffer);
+    vk_image_depth_buffer = VK_NULL_HANDLE;
+    vma_allocation_depth_buffer = nullptr;
 
 	const VkImageCreateInfo depth_buffer = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -328,6 +381,21 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 	}
 
 	const uint32_t swapchain_images_count = uint32_t(vk_swapchain_images.size());
+    if (vk_semaphores_image_finished.size() != swapchain_images_count) {
+        for (VkSemaphore semaphore : vk_semaphores_image_finished) {
+            vkDestroySemaphore(context.device, semaphore, nullptr);
+        }
+        vk_semaphores_image_finished.assign(swapchain_images_count, VK_NULL_HANDLE);
+        VkSemaphoreCreateInfo semaphore_info{};
+        semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        for (VkSemaphore& semaphore : vk_semaphores_image_finished) {
+            if (vkCreateSemaphore(context.device, &semaphore_info, nullptr,
+                                  &semaphore) != VK_SUCCESS) {
+                stopRendering("Failed to create presentation semaphore after resizing");
+                return false;
+            }
+        }
+    }
 
 	VkImageView framebuffer_attachments[] = {
 		VK_NULL_HANDLE,
@@ -387,6 +455,7 @@ bool rebuildSwapchain(uint32_t width, uint32_t height) {
 Context context;
 
 bool initialize(GLFWwindow* const window) {
+    vk_window = window;
 	vkb::InstanceBuilder ib;
 
 	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 1, 0))
@@ -480,6 +549,9 @@ bool initialize(GLFWwindow* const window) {
 	vk_swapchain_images = vkb_swapchain.get_images().value();
 	vk_swapchain_image_views = vkb_swapchain.get_image_views().value();
 	vk_swapchain_current_image = UINT32_MAX;
+    vk_swapchain_resize_width = context.swapchain_extent.width;
+    vk_swapchain_resize_height = context.swapchain_extent.height;
+    vk_swapchain_resize_require = false;
 
 	const uint32_t swapchain_images_count = uint32_t(vk_swapchain_images.size());
 
@@ -682,22 +754,22 @@ void shutdown() {
 	vkDestroyCommandPool(context.device, vk_command_pool, nullptr);
 
 	vkDestroyFence(context.device, vk_fence_frame_in_flight, nullptr);
-	for (size_t i = 0, n = vk_swapchain_images.size(); i < n; ++i) {
-		vkDestroySemaphore(context.device, vk_semaphores_image_finished[i], nullptr);
-	}
+    for (VkSemaphore semaphore : vk_semaphores_image_finished) {
+        vkDestroySemaphore(context.device, semaphore, nullptr);
+    }
 	vkDestroySemaphore(context.device, vk_semaphore_image_available, nullptr);
 
-	for (size_t i = 0, n = vk_swapchain_images.size(); i < n; ++i) {
-		vkDestroyFramebuffer(context.device, vk_framebuffers[i], nullptr);
-	}
+    for (VkFramebuffer framebuffer : vk_framebuffers) {
+        vkDestroyFramebuffer(context.device, framebuffer, nullptr);
+    }
 	vkDestroyRenderPass(context.device, context.render_pass, nullptr);
 
 	vkDestroyImageView(context.device, vk_image_view_depth_buffer, nullptr);
 	vmaDestroyImage(context.allocator, vk_image_depth_buffer, vma_allocation_depth_buffer);
 
-	for (size_t i = 0, n = vk_swapchain_images.size(); i < n; ++i) {
-		vkDestroyImageView(context.device, vk_swapchain_image_views[i], nullptr);
-	}
+    for (VkImageView image_view : vk_swapchain_image_views) {
+        vkDestroyImageView(context.device, image_view, nullptr);
+    }
 	vkDestroySwapchainKHR(context.device, vk_swapchain, nullptr);
 
 	vmaDestroyAllocator(context.allocator);
@@ -720,34 +792,55 @@ void resize(uint32_t width, uint32_t height) {
 }
 
 FrameData prepare() {
-	vkWaitForFences(context.device, 1, &vk_fence_frame_in_flight, VK_TRUE, UINT64_MAX);
+    if (vkWaitForFences(context.device, 1, &vk_fence_frame_in_flight,
+                        VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        stopRendering("Failed to wait for the previous frame");
+        return {};
+    }
 
-retry_acquire:
-	switch (vkAcquireNextImageKHR(context.device, vk_swapchain, UINT64_MAX,
-								  vk_semaphore_image_available, VK_NULL_HANDLE,
-								  &vk_swapchain_current_image)) {
-	case VK_SUCCESS:
-		break;
+    if (vk_swapchain_resize_require &&
+        !rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height)) {
+        glfwSetWindowShouldClose(vk_window, GLFW_TRUE);
+        return {};
+    }
 
-	case VK_ERROR_OUT_OF_DATE_KHR:
-		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
-		goto retry_acquire;
+    for (;;) {
+        const VkResult result = vkAcquireNextImageKHR(
+            context.device, vk_swapchain, UINT64_MAX,
+            vk_semaphore_image_available, VK_NULL_HANDLE,
+            &vk_swapchain_current_image);
 
-	case VK_SUBOPTIMAL_KHR:
-		std::cerr << "Swapchain is suboptimal for rendering!\n";
-		break;
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+            // A suboptimal acquisition still signals the semaphore. Render and
+            // submit this frame before rebuilding, so its signal is consumed.
+            if (result == VK_SUBOPTIMAL_KHR) {
+                vk_swapchain_resize_require = true;
+            }
+            break;
+        }
 
-	default:
-		std::cerr << "Failed to present Vulkan swapchain image\n";
-		return {};
-	}
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            if (!rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height)) {
+                glfwSetWindowShouldClose(vk_window, GLFW_TRUE);
+                return {};
+            }
+            continue;
+        }
 
-	vkResetFences(context.device, 1, &vk_fence_frame_in_flight);
+        std::cerr << "vkAcquireNextImageKHR failed: " << result << '\n';
+        glfwSetWindowShouldClose(vk_window, GLFW_TRUE);
+        return {};
+    }
 
-	return {
-		.framebuffer = vk_framebuffers[vk_swapchain_current_image],
-		.command_buffer = vk_command_buffer,
-	};
+    if (vkResetFences(context.device, 1, &vk_fence_frame_in_flight) != VK_SUCCESS) {
+        stopRendering("Failed to reset the frame fence");
+        return {};
+    }
+
+    return {
+        .framebuffer = vk_framebuffers[vk_swapchain_current_image],
+        .command_buffer = vk_command_buffer,
+    };
 }
 
 void submitAndPresent() {
@@ -770,7 +863,13 @@ void submitAndPresent() {
 		.pSignalSemaphores = &vk_semaphores_image_finished[vk_swapchain_current_image],
 	};
 
-	vkQueueSubmit(context.graphics_queue, 1, &submit, vk_fence_frame_in_flight);
+    const VkResult submit_result = vkQueueSubmit(
+        context.graphics_queue, 1, &submit, vk_fence_frame_in_flight);
+    if (submit_result != VK_SUCCESS) {
+        std::cerr << "vkQueueSubmit failed: " << submit_result << '\n';
+        glfwSetWindowShouldClose(vk_window, GLFW_TRUE);
+        return;
+    }
 
 	const VkPresentInfoKHR present = {
 		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -781,14 +880,21 @@ void submitAndPresent() {
 		.pImageIndices = &vk_swapchain_current_image,
 	};
 
-	VkResult result = vkQueuePresentKHR(context.graphics_queue, &present);
-	if (result == VK_ERROR_OUT_OF_DATE_KHR ||
-	    result == VK_SUBOPTIMAL_KHR ||
-	    vk_swapchain_resize_require) {
-		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
-	} else {
-		std::cerr << "Failed to present Vulkan swapchain image\n";
-	}
+    const VkResult result = vkQueuePresentKHR(context.graphics_queue, &present);
+    if (result != VK_SUCCESS && result != VK_ERROR_OUT_OF_DATE_KHR &&
+        result != VK_SUBOPTIMAL_KHR) {
+        std::cerr << "vkQueuePresentKHR failed: " << result << '\n';
+        glfwSetWindowShouldClose(vk_window, GLFW_TRUE);
+        return;
+    }
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR ||
+        vk_swapchain_resize_require) {
+        if (!rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height)) {
+            glfwSetWindowShouldClose(vk_window, GLFW_TRUE);
+        }
+    }
 }
 
 } // namespace graphics::internal
+

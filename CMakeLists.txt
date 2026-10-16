@@ -12,7 +12,7 @@ elseif(APPLE)
 elseif(WIN32)
 	if(MSVC)
 		target_compile_options(${PROJECT_NAME} PRIVATE /W4 /wd4201)
-		target_link_options(${PROJECT_NAME} PRIVATE /subsystem:windows /entry:mainCRTStartup)
+		target_link_options(${PROJECT_NAME} PRIVATE /subsystem:console /entry:mainCRTStartup)
 	else()
 		target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 		target_link_options(${PROJECT_NAME} PRIVATE -mwindows)
@@ -80,32 +80,25 @@ target_sources(${PROJECT_NAME} PRIVATE
 	${imgui_SOURCE_DIR}/imgui_demo.cpp
 )
 
-# Compile shaders
-find_program(GLSLC_FOUND glslc)
-if(GLSLC_FOUND)
-	set(_SHADER_BINARIES)
+# Compile shaders (the recipe from the starter project, with quoted paths).
+find_program(GLSLC_EXECUTABLE NAMES glslc HINTS "$ENV{VULKAN_SDK}/Bin" REQUIRED)
+set(_SHADER_BINARIES)
 
-	macro(compile_shader SHADER_FILE)
-		set(SHADER_SOURCE ${CMAKE_SOURCE_DIR}/shaders/${SHADER_FILE})
-		set(SHADER_BINARY ${SHADER_FILE}.spv)
-		set(SHADER_BINARY_PATH ${CMAKE_SOURCE_DIR}/shaders/${SHADER_BINARY})
+macro(compile_shader SHADER_FILE)
+    set(SHADER_SOURCE "${CMAKE_SOURCE_DIR}/shaders/${SHADER_FILE}")
+    set(SHADER_BINARY_PATH "${SHADER_SOURCE}.spv")
+    add_custom_command(
+        OUTPUT "${SHADER_BINARY_PATH}"
+        COMMAND "${GLSLC_EXECUTABLE}" --target-env=vulkan1.1 "${SHADER_SOURCE}" -o "${SHADER_BINARY_PATH}"
+        DEPENDS "${SHADER_SOURCE}"
+        COMMENT "Compiling ${SHADER_FILE}"
+        VERBATIM
+    )
+    list(APPEND _SHADER_BINARIES "${SHADER_BINARY_PATH}")
+endmacro()
 
-		add_custom_command(
-			OUTPUT ${SHADER_BINARY_PATH}
-			COMMAND glslc ${SHADER_SOURCE} -o ${SHADER_BINARY_PATH}
-			DEPENDS ${SHADER_SOURCE}
-			COMMENT "Compiling ${SHADER_FILE} shader"
-		)
+compile_shader(parallelepiped.vert)
+compile_shader(parallelepiped.frag)
+add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
+add_dependencies(${PROJECT_NAME} shaders)
 
-		list(APPEND _SHADER_BINARIES ${SHADER_BINARY_PATH})
-	endmacro()
-
-	# To compile shader file, use compile_shader function with a file name
-	# of a shader inside shaders directory. See example below:
-
-	# compile_shader(example.vert)
-	# compile_shader(example.frag)
-
-	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
-	add_dependencies(${PROJECT_NAME} shaders)
-endif()

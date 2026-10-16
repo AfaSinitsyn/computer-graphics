@@ -1,3 +1,4 @@
+// Modified 2026-10-16: pause zero-size frames and reject an invalid FrameData.
 #include <cstdint>
 #include <climits>
 
@@ -72,20 +73,36 @@ int main() {
 		goto err_application_init;
 	}
 
-	while (!glfwWindowShouldClose(glfw_window)) {
-		const double time = glfwGetTime();
+    while (!glfwWindowShouldClose(glfw_window)) {
+        glfwPollEvents();
+        if (glfwWindowShouldClose(glfw_window)) {
+            break;
+        }
 
-		glfwPollEvents();
-		ImGui_ImplGlfw_NewFrame();
+        int width = 0;
+        int height = 0;
+        glfwGetFramebufferSize(glfw_window, &width, &height);
+        if (width == 0 || height == 0) {
+            glfwWaitEvents();
+            continue;
+        }
 
-		ImGui::NewFrame();
-		application::update(time);
-		ImGui::Render();
+        // Wait for the previous GPU frame before updating application data.
+        graphics::internal::FrameData fd = graphics::internal::prepare();
+        if (fd.framebuffer == VK_NULL_HANDLE || fd.command_buffer == VK_NULL_HANDLE) {
+            status = glfwWindowShouldClose(glfw_window) ? EXIT_SUCCESS : EXIT_FAILURE;
+            break;
+        }
 
-		graphics::internal::FrameData fd = graphics::internal::prepare();
-		application::render(fd);
-		graphics::internal::submitAndPresent();
-	}
+        const double time = glfwGetTime();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        application::update(time);
+        ImGui::Render();
+
+        application::render(fd);
+        graphics::internal::submitAndPresent();
+    }
 
 	application::shutdown();
 err_application_init:
@@ -99,5 +116,5 @@ err_imgui_init:
 err_null_window:
 	glfwTerminate();
 
-	return 0;
+	return status;
 }
