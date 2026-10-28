@@ -1,4 +1,4 @@
-// Lab 1, variant 3. Application code for vladeemerr/vulkan-starter-app.
+// Lab 2, variant 3. Application code for vladeemerr/vulkan-starter-app.
 #include "application.hpp"
 #include "lab_scene.hpp"
 
@@ -25,6 +25,12 @@ struct Buffer {
 
 struct Settings {
     lab::ObjectState object;
+    lab::Camera camera;
+    lab::DirectionalLight directional;
+    std::vector<lab::PointLight> points;
+    std::vector<lab::SpotLight> spots;
+    float ambient_color[3]{1,1,1};
+    float ambient_intensity=0.12f;
     int projection=0; // 0: perspective; 1: orthographic.
     bool playing=false;
     double animation_time=0;
@@ -33,9 +39,11 @@ struct Settings {
 
 Settings settings;
 double previous_time=-1.0;
-Buffer vertex_buffer, index_buffer, uniform_buffer;
-VkDescriptorSet descriptor_set=VK_NULL_HANDLE;
-VkDescriptorSetLayout descriptor_layout=VK_NULL_HANDLE;
+Buffer vertex_buffer, index_buffer;
+Buffer scene_buffer, model_buffer, point_buffer, spot_buffer;
+VkDescriptorSet descriptor_sets[2]{}; // 0: scene, 1: model
+VkDescriptorSetLayout descriptor_layouts[2]{};
+VkDeviceSize max_storage_range=0;
 VkDescriptorPool descriptor_pool=VK_NULL_HANDLE;
 VkPipelineLayout pipeline_layout=VK_NULL_HANDLE;
 VkPipeline pipeline=VK_NULL_HANDLE;
@@ -112,52 +120,90 @@ void createGeometry() {
                  mesh.indices.data());
 }
 
+void bindBuffer(VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+                const Buffer& buffer) {
+    VkDescriptorBufferInfo buffer_info{};
+    buffer_info.buffer=buffer.handle;
+    buffer_info.range=buffer.size;
+    VkWriteDescriptorSet write{};
+    write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet=set;
+    write.dstBinding=binding;
+    write.descriptorCount=1;
+    write.descriptorType=type;
+    write.pBufferInfo=&buffer_info;
+    vkUpdateDescriptorSets(graphics::internal::context.device,1,&write,0,nullptr);
+}
+
 void createDescriptors() {
     auto& context=graphics::internal::context;
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding=0;
-    binding.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    binding.descriptorCount=1;
-    binding.stageFlags=VK_SHADER_STAGE_VERTEX_BIT;
-
+    VkDescriptorSetLayoutBinding scene_bindings[3]{};
+    for (uint32_t i=0; i<3; ++i) {
+        scene_bindings[i].binding=i;
+        scene_bindings[i].descriptorCount=1;
+        scene_bindings[i].descriptorType=i==0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                                             : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        scene_bindings[i].stageFlags=i==0 ? VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT
+                                         : VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo layout_info{};
     layout_info.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout_info.bindingCount=1;
-    layout_info.pBindings=&binding;
-    checkVk(vkCreateDescriptorSetLayout(context.device,&layout_info,nullptr,&descriptor_layout),
-            "vkCreateDescriptorSetLayout");
+    layout_info.bindingCount=3;
+    layout_info.pBindings=scene_bindings;
+    checkVk(vkCreateDescriptorSetLayout(context.device,&layout_info,nullptr,&descriptor_layouts[0]),
+            "vkCreateDescriptorSetLayout(scene)");
 
-    VkDescriptorPoolSize pool_size{};
-    pool_size.type=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    pool_size.descriptorCount=1;
+    VkDescriptorSetLayoutBinding model_binding{};
+    model_binding.binding=0;
+    model_binding.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    model_binding.descriptorCount=1;
+    model_binding.stageFlags=VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    layout_info.bindingCount=1;
+    layout_info.pBindings=&model_binding;
+    checkVk(vkCreateDescriptorSetLayout(context.device,&layout_info,nullptr,&descriptor_layouts[1]),
+            "vkCreateDescriptorSetLayout(model)");
+
+    VkDescriptorPoolSize pool_sizes[2]{};
+    pool_sizes[0]={VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,2};
+    pool_sizes[1]={VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,2};
     VkDescriptorPoolCreateInfo pool_info{};
     pool_info.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.maxSets=1;
-    pool_info.poolSizeCount=1;
-    pool_info.pPoolSizes=&pool_size;
+    pool_info.maxSets=2;
+    pool_info.poolSizeCount=2;
+    pool_info.pPoolSizes=pool_sizes;
     checkVk(vkCreateDescriptorPool(context.device,&pool_info,nullptr,&descriptor_pool),
             "vkCreateDescriptorPool");
 
     VkDescriptorSetAllocateInfo allocate_info{};
     allocate_info.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocate_info.descriptorPool=descriptor_pool;
-    allocate_info.descriptorSetCount=1;
-    allocate_info.pSetLayouts=&descriptor_layout;
-    checkVk(vkAllocateDescriptorSets(context.device,&allocate_info,&descriptor_set),
+    allocate_info.descriptorSetCount=2;
+    allocate_info.pSetLayouts=descriptor_layouts;
+    checkVk(vkAllocateDescriptorSets(context.device,&allocate_info,descriptor_sets),
             "vkAllocateDescriptorSets");
 
-    createBuffer(uniform_buffer,sizeof(lab::GlobalUniforms),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    VkDescriptorBufferInfo buffer_info{};
-    buffer_info.buffer=uniform_buffer.handle;
-    buffer_info.range=sizeof(lab::GlobalUniforms);
-    VkWriteDescriptorSet write{};
-    write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet=descriptor_set;
-    write.dstBinding=0;
-    write.descriptorCount=1;
-    write.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    write.pBufferInfo=&buffer_info;
-    vkUpdateDescriptorSets(context.device,1,&write,0,nullptr);
+    createBuffer(scene_buffer,sizeof(lab::SceneUniforms),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    createBuffer(model_buffer,sizeof(lab::ModelUniforms),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    // Vulkan buffers cannot have zero size, even when the light array is empty.
+    createBuffer(point_buffer,sizeof(lab::PointLightGPU),VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    createBuffer(spot_buffer,sizeof(lab::SpotLightGPU),VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    bindBuffer(descriptor_sets[0],0,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,scene_buffer);
+    bindBuffer(descriptor_sets[0],1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,point_buffer);
+    bindBuffer(descriptor_sets[0],2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,spot_buffer);
+    bindBuffer(descriptor_sets[1],0,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,model_buffer);
+}
+
+void updateStorageBuffer(Buffer& buffer, uint32_t binding, const void* data, VkDeviceSize size) {
+    if (size==0) return;
+    if (size>max_storage_range)
+        throw std::runtime_error("Light array exceeds the GPU storage buffer limit");
+    if (size>buffer.size) {
+        // main.cpp already waited for the previous frame's fence before update().
+        destroyBuffer(buffer);
+        createBuffer(buffer,size,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        bindBuffer(descriptor_sets[0],binding,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,buffer);
+    }
+    writeBuffer(buffer,data,size);
 }
 
 void createPipeline() {
@@ -178,7 +224,7 @@ void createPipeline() {
     vertex_binding.binding=0;
     vertex_binding.stride=sizeof(lab::Vertex);
     vertex_binding.inputRate=VK_VERTEX_INPUT_RATE_VERTEX;
-    VkVertexInputAttributeDescription attributes[2]{};
+    VkVertexInputAttributeDescription attributes[3]{};
     attributes[0].location=0;
     attributes[0].binding=0;
     attributes[0].format=VK_FORMAT_R32G32B32_SFLOAT;
@@ -188,11 +234,16 @@ void createPipeline() {
     attributes[1].format=VK_FORMAT_R32G32B32_SFLOAT;
     attributes[1].offset=offsetof(lab::Vertex,color);
 
+    attributes[2].location=2;
+    attributes[2].binding=0;
+    attributes[2].format=VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[2].offset=offsetof(lab::Vertex,normal);
+
     VkPipelineVertexInputStateCreateInfo vertex_input{};
     vertex_input.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vertex_input.vertexBindingDescriptionCount=1;
     vertex_input.pVertexBindingDescriptions=&vertex_binding;
-    vertex_input.vertexAttributeDescriptionCount=2;
+    vertex_input.vertexAttributeDescriptionCount=3;
     vertex_input.pVertexAttributeDescriptions=attributes;
     VkPipelineInputAssemblyStateCreateInfo assembly{};
     assembly.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -232,8 +283,8 @@ void createPipeline() {
 
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layout_info.setLayoutCount=1;
-    layout_info.pSetLayouts=&descriptor_layout;
+    layout_info.setLayoutCount=2;
+    layout_info.pSetLayouts=descriptor_layouts;
     checkVk(vkCreatePipelineLayout(context.device,&layout_info,nullptr,&pipeline_layout),
             "vkCreatePipelineLayout");
     VkGraphicsPipelineCreateInfo info{};
@@ -260,13 +311,67 @@ void createPipeline() {
 }
 
 uint32_t panelWidth() {
-    return std::min(360u,graphics::internal::context.swapchain_extent.width/3u);
+    return std::min(410u,graphics::internal::context.swapchain_extent.width/3u);
 }
 
 VkRect2D sceneRectangle() {
     const auto extent=graphics::internal::context.swapchain_extent;
     const uint32_t left=std::min(panelWidth()+24u,extent.width-1u);
     return {{static_cast<int32_t>(left),0},{extent.width-left,extent.height}};
+}
+
+void showPointLights() {
+    if (!ImGui::CollapsingHeader("Point lights",ImGuiTreeNodeFlags_DefaultOpen)) return;
+    ImGui::PushID("point-lights");
+    ImGui::BeginDisabled((settings.points.size()+1)*sizeof(lab::PointLightGPU)>max_storage_range);
+    if (ImGui::Button("Add point light")) settings.points.emplace_back();
+    ImGui::EndDisabled();
+    for (size_t i=0; i<settings.points.size();) {
+        ImGui::PushID(static_cast<int>(i));
+        auto& light=settings.points[i];
+        ImGui::Separator();
+        ImGui::Text("Point %u",static_cast<unsigned>(i+1));
+        if (ImGui::Button("Remove point")) {
+            settings.points.erase(settings.points.begin()+i);
+            ImGui::PopID();
+            continue;
+        }
+        ImGui::DragFloat3("Position",light.position,0.05f);
+        ImGui::ColorEdit3("Color",light.color);
+        ImGui::SliderFloat("Intensity",&light.intensity,0.0f,50.0f);
+        ImGui::PopID();
+        ++i;
+    }
+    ImGui::PopID();
+}
+
+void showSpotLights() {
+    if (!ImGui::CollapsingHeader("Spot lights",ImGuiTreeNodeFlags_DefaultOpen)) return;
+    ImGui::PushID("spot-lights");
+    ImGui::BeginDisabled((settings.spots.size()+1)*sizeof(lab::SpotLightGPU)>max_storage_range);
+    if (ImGui::Button("Add spot light")) settings.spots.emplace_back();
+    ImGui::EndDisabled();
+    for (size_t i=0; i<settings.spots.size();) {
+        ImGui::PushID(static_cast<int>(i));
+        auto& light=settings.spots[i];
+        ImGui::Separator();
+        ImGui::Text("Spot %u",static_cast<unsigned>(i+1));
+        if (ImGui::Button("Remove spot")) {
+            settings.spots.erase(settings.spots.begin()+i);
+            ImGui::PopID();
+            continue;
+        }
+        ImGui::DragFloat3("Position",light.position,0.05f);
+        ImGui::DragFloat3("Direction",light.direction,0.02f);
+        ImGui::ColorEdit3("Color",light.color);
+        ImGui::SliderFloat("Intensity",&light.intensity,0.0f,50.0f);
+        ImGui::SliderFloat("Inner angle",&light.inner_angle,0.1f,89.0f,"%.1f deg",ImGuiSliderFlags_AlwaysClamp);
+        light.outer_angle=std::max(light.outer_angle,light.inner_angle);
+        ImGui::SliderFloat("Outer angle",&light.outer_angle,light.inner_angle,89.0f,"%.1f deg",ImGuiSliderFlags_AlwaysClamp);
+        ImGui::PopID();
+        ++i;
+    }
+    ImGui::PopID();
 }
 
 void showControls() {
@@ -276,42 +381,111 @@ void showControls() {
         std::max(200.0f,static_cast<float>(extent.height)-24.0f)),ImGuiCond_Always);
     const ImGuiWindowFlags flags=ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
                                  ImGuiWindowFlags_NoCollapse;
-    if (ImGui::Begin("Computer Graphics | Lab 1",nullptr,flags)) {
-        ImGui::TextUnformatted("Variant 3: Parallelepiped");
-        ImGui::SeparatorText("Projection");
-        ImGui::Combo("Type",&settings.projection,"Perspective\0Orthographic\0");
-
-        ImGui::SeparatorText("Object");
+    if (ImGui::Begin("Computer Graphics | Lab 2",nullptr,flags)) {
+        ImGui::TextUnformatted("Variant 3: Parallelepiped | Blinn-Phong");
+        ImGui::TextWrapped("Scroll to see all controls. Directions follow the light rays.");
+        if (ImGui::CollapsingHeader("Camera",ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::PushID("camera");
+            ImGui::Combo("Projection",&settings.projection,"Perspective\0Orthographic\0");
+            ImGui::DragFloat3("Position",settings.camera.position,0.03f);
+            ImGui::DragFloat3("Rotation",settings.camera.rotation,0.5f,-180.0f,180.0f,"%.1f");
+            ImGui::SliderFloat("FOV",&settings.camera.fov,15.0f,100.0f,"%.1f deg",ImGuiSliderFlags_AlwaysClamp);
+            if (settings.projection==1)
+                ImGui::SliderFloat("View height",&settings.camera.ortho_height,1.0f,15.0f,"%.2f",ImGuiSliderFlags_AlwaysClamp);
+            if (ImGui::Button("Reset camera")) settings.camera=lab::Camera{};
+            ImGui::PopID();
+        }
         auto& object=settings.object;
-        ImGui::DragFloat3("Position",object.position,0.02f,-6.0f,6.0f,"%.2f");
-        ImGui::DragFloat3("Rotation",object.rotation,0.5f,-180.0f,180.0f,"%.1f");
-        ImGui::DragFloat3("Scale",object.scale,0.01f,0.1f,3.0f,"%.2f");
-        ImGui::ColorEdit3("Color",object.tint);
-
-        ImGui::SeparatorText("Animation");
-        if (ImGui::Button(settings.playing ? "Pause" : "Play"))
-            settings.playing=!settings.playing;
-        ImGui::SliderFloat("Speed",&settings.animation_speed,0.0f,3.0f,"%.2fx");
-        ImGui::SliderFloat("Path radius",&object.path_radius,0.0f,2.5f,"%.2f");
-        ImGui::SliderFloat("Path height",&object.path_height,0.0f,1.5f,"%.2f");
-        ImGui::Text("Animation time: %.2f s",settings.animation_time);
+        if (ImGui::CollapsingHeader("Object")) {
+            ImGui::PushID("object");
+            ImGui::DragFloat3("Position",object.position,0.02f,-6.0f,6.0f,"%.2f");
+            ImGui::DragFloat3("Rotation",object.rotation,0.5f,-180.0f,180.0f,"%.1f");
+            ImGui::DragFloat3("Scale",object.scale,0.01f,0.1f,3.0f,"%.2f",ImGuiSliderFlags_AlwaysClamp);
+            if (ImGui::Button(settings.playing ? "Pause" : "Play")) settings.playing=!settings.playing;
+            ImGui::SliderFloat("Speed",&settings.animation_speed,0.0f,3.0f,"%.2fx");
+            ImGui::SliderFloat("Path radius",&object.path_radius,0.0f,2.5f);
+            ImGui::SliderFloat("Path height",&object.path_height,0.0f,1.5f);
+            ImGui::PopID();
+        }
+        if (ImGui::CollapsingHeader("Material",ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::ColorEdit3("Albedo",object.tint);
+            ImGui::ColorEdit3("Specular color",object.specular);
+            ImGui::SliderFloat("Shininess",&object.shininess,1.0f,256.0f,"%.1f",ImGuiSliderFlags_AlwaysClamp);
+            ImGui::Checkbox("Use vertex colors",&object.vertex_colors);
+        }
+        if (ImGui::CollapsingHeader("Ambient",ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::ColorEdit3("Ambient color",settings.ambient_color);
+            ImGui::SliderFloat("Ambient intensity",&settings.ambient_intensity,0.0f,1.0f);
+        }
+        if (ImGui::CollapsingHeader("Directional light",ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::PushID("directional");
+            ImGui::DragFloat3("Direction",settings.directional.direction,0.02f);
+            ImGui::ColorEdit3("Color",settings.directional.color);
+            ImGui::SliderFloat("Intensity",&settings.directional.intensity,0.0f,3.0f);
+            ImGui::PopID();
+        }
+        showPointLights();
+        showSpotLights();
     }
     ImGui::End();
+}
+
+void copy3(const float* source, float* target) {
+    std::copy_n(source,3,target);
 }
 
 void updateUniforms() {
     const VkRect2D scene=sceneRectangle();
     const float aspect=static_cast<float>(scene.extent.width)/static_cast<float>(scene.extent.height);
-    // The lecture projection uses positive camera-space Z.
-    const lab::Mat4 view=lab::translation({0,0,6.0f});
     const lab::Mat4 projection=settings.projection==0
-        ? lab::perspective(lab::radians(45.0f),aspect,0.1f,100.0f)
-        : lab::orthographic(5.0f,aspect,0.1f,100.0f);
-    lab::GlobalUniforms data{};
-    data.matrix=projection*view*lab::modelMatrix(settings.object,settings.animation_time);
-    std::copy_n(settings.object.tint,3,data.color);
-    data.color[3]=1.0f;
-    writeBuffer(uniform_buffer,&data,sizeof(data));
+        ? lab::perspective(lab::radians(settings.camera.fov),aspect,0.1f,100.0f)
+        : lab::orthographic(settings.camera.ortho_height,aspect,0.1f,100.0f);
+
+    lab::SceneUniforms scene_data{};
+    scene_data.view_projection=projection*lab::viewMatrix(settings.camera);
+    copy3(settings.camera.position,scene_data.camera_position);
+    copy3(settings.ambient_color,scene_data.ambient);
+    scene_data.ambient[3]=settings.ambient_intensity;
+    const auto& directional=settings.directional;
+    const lab::Vec3 dir=lab::normalize({directional.direction[0],directional.direction[1],directional.direction[2]});
+    scene_data.light_direction[0]=dir.x;
+    scene_data.light_direction[1]=dir.y;
+    scene_data.light_direction[2]=dir.z;
+    copy3(directional.color,scene_data.light_color);
+    scene_data.light_color[3]=directional.intensity;
+    scene_data.light_counts[0]=static_cast<uint32_t>(settings.points.size());
+    scene_data.light_counts[1]=static_cast<uint32_t>(settings.spots.size());
+    writeBuffer(scene_buffer,&scene_data,sizeof(scene_data));
+
+    lab::ModelUniforms model_data{};
+    model_data.model=lab::modelMatrix(settings.object,settings.animation_time);
+    copy3(settings.object.tint,model_data.albedo);
+    copy3(settings.object.specular,model_data.specular);
+    model_data.parameters[0]=settings.object.shininess;
+    model_data.parameters[1]=settings.object.vertex_colors ? 1.0f : 0.0f;
+    writeBuffer(model_buffer,&model_data,sizeof(model_data));
+
+    std::vector<lab::PointLightGPU> points(settings.points.size());
+    for (size_t i=0; i<points.size(); ++i) {
+        copy3(settings.points[i].position,points[i].position);
+        copy3(settings.points[i].color,points[i].color);
+        points[i].color[3]=settings.points[i].intensity;
+    }
+    updateStorageBuffer(point_buffer,1,points.data(),points.size()*sizeof(lab::PointLightGPU));
+    std::vector<lab::SpotLightGPU> spots(settings.spots.size());
+    for (size_t i=0; i<spots.size(); ++i) {
+        const auto& light=settings.spots[i];
+        copy3(light.position,spots[i].position);
+        const lab::Vec3 direction=lab::normalize({light.direction[0],light.direction[1],light.direction[2]});
+        spots[i].direction[0]=direction.x;
+        spots[i].direction[1]=direction.y;
+        spots[i].direction[2]=direction.z;
+        copy3(light.color,spots[i].color);
+        spots[i].color[3]=light.intensity;
+        spots[i].cutoffs[0]=std::cos(lab::radians(light.inner_angle));
+        spots[i].cutoffs[1]=std::cos(lab::radians(light.outer_angle));
+    }
+    updateStorageBuffer(spot_buffer,2,spots.data(),spots.size()*sizeof(lab::SpotLightGPU));
 }
 
 } // namespace
@@ -320,6 +494,9 @@ bool initialize() {
     settings=Settings{};
     previous_time=-1.0;
     try {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(graphics::internal::context.physical_device,&properties);
+        max_storage_range=properties.limits.maxStorageBufferRange;
         createGeometry();
         createDescriptors();
         createPipeline();
@@ -345,10 +522,15 @@ void shutdown() {
     vertex_shader=fragment_shader=VK_NULL_HANDLE;
     vkDestroyDescriptorPool(context.device,descriptor_pool,nullptr);
     descriptor_pool=VK_NULL_HANDLE;
-    descriptor_set=VK_NULL_HANDLE;
-    vkDestroyDescriptorSetLayout(context.device,descriptor_layout,nullptr);
-    descriptor_layout=VK_NULL_HANDLE;
-    destroyBuffer(uniform_buffer);
+    for (int i=0; i<2; ++i) {
+        descriptor_sets[i]=VK_NULL_HANDLE;
+        vkDestroyDescriptorSetLayout(context.device,descriptor_layouts[i],nullptr);
+        descriptor_layouts[i]=VK_NULL_HANDLE;
+    }
+    destroyBuffer(spot_buffer);
+    destroyBuffer(point_buffer);
+    destroyBuffer(model_buffer);
+    destroyBuffer(scene_buffer);
     destroyBuffer(index_buffer);
     destroyBuffer(vertex_buffer);
 }
@@ -395,7 +577,7 @@ void render(const graphics::internal::FrameData& fd) {
     vkCmdBindIndexBuffer(fd.command_buffer,index_buffer.handle,0,VK_INDEX_TYPE_UINT16);
 
     vkCmdBindDescriptorSets(fd.command_buffer,VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            pipeline_layout,0,1,&descriptor_set,0,nullptr);
+                            pipeline_layout,0,2,descriptor_sets,0,nullptr);
     vkCmdDrawIndexed(fd.command_buffer,36,1,0,0,0);
 
     vkCmdEndRenderPass(fd.command_buffer);

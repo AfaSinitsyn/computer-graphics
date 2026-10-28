@@ -22,6 +22,11 @@ inline Vec3 cross(Vec3 a, Vec3 b) {
     return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x};
 }
 
+inline Vec3 normalize(Vec3 v) {
+    const float length=std::sqrt(dot(v,v));
+    return length>0.00001f ? v*(1.0f/length) : Vec3{0,0,1};
+}
+
 // Column-major storage, matching a GLSL mat4. Vectors are columns.
 struct alignas(16) Mat4 {
     std::array<float, 16> elements{};
